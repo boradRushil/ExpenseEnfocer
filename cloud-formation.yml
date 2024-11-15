@@ -1,0 +1,555 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  # My App Prefix for all resources
+  Prefix:
+    Type: String
+    Default: expense-enforcer
+
+  # My App Environment
+  Environment:
+    Type: String
+    Default: prod
+
+  # My App Region
+  Region:
+    Type: String
+    Default: us-east-1
+
+  # API Gateway Name
+  ApiName:
+    Type: String
+    Default: ExpenseEnforcerApi
+
+  # Table Name for Expenses
+  ExpensesTableName:
+    Type: String
+    Default: Expenses
+
+  # Table Name for Users
+  UsersTableName:
+    Type: String
+    Default: Users
+
+  # My App Code Bucket
+  CodeBucket:
+    Type: String
+    Default: expense-enforcer-code-bucket
+
+  # EC2 instance type
+  InstanceType:
+    Description: Select instance type
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+
+  #Name of existing Key Pair for EC2
+  KeyName:
+    Default: expense-enforcer-key
+    Description: Name of the EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+
+Resources:
+  # API Gateway
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Ref ApiName
+
+  # Layer for common code
+  LambdaLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: common-layer
+      Content:
+        S3Bucket: !Ref CodeBucket
+        S3Key: node_modules.zip
+      CompatibleRuntimes:
+        - nodejs20.x
+
+ # DynamoDB Table for Expenses information
+  ExpensesTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName: !Ref ExpensesTableName
+      AttributeDefinitions:
+        - AttributeName: "expenseId"
+          AttributeType: "S"
+        - AttributeName: "userId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "expenseId"
+          KeyType: "HASH"
+        - AttributeName: "userId"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      GlobalSecondaryIndexes:
+        - IndexName: "UserIdIndex"
+          KeySchema:
+            - AttributeName: "userId"
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+          ProvisionedThroughput:
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+
+  # DynamoDB Table for Users information
+  UsersTable:
+    Type: "AWS::DynamoDB::Table"
+    Properties:
+      TableName: !Ref UsersTableName
+      AttributeDefinitions:
+        - AttributeName: "userId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "userId"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+
+  # CognitoUserPool : User pool for the authentication
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: ${Prefix}-UserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  # CognitoUserPoolClient : Client for the user pool
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: ${Prefix}-UserPoolClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - USER_PASSWORD_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # User Pool trigger function to store user details in DynamoDB
+  UserPoolTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserPoolTriggerFunction
+      Handler: index.handler
+      Role: arn:aws:iam::747748645214:role/LabRole
+      Layers:
+        - !Ref LambdaLayer
+      Code:
+        S3Bucket: !Ref CodeBucket
+        S3Key: user-pool-trigger.zip
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref UsersTable
+          SNS_TOPIC_ARN: !Ref ReminderSnsTopic
+
+  # Lambda function to send daily reminders to users
+  SendNotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: sendNotification
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Role: arn:aws:iam::747748645214:role/LabRole
+      Layers:
+        - !Ref LambdaLayer
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ReminderSnsTopic
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: send-notifications.zip
+
+  # SNS Topic for sending daily reminders
+  ReminderSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: reminder-sns-topic
+
+  # Permission for SNS Topic to invoke Lambda function for daily reminders
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SendNotificationLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyReminderRule.Arn
+
+  # EventBridge Rule for sending daily reminders
+  DailyReminderRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: daily-reminder
+      ScheduleExpression: cron(0 21 * * ? *)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SendNotificationLambda.Arn
+          Id: "SendNotificationLambdaTarget"
+
+  ReminderEventBridgeRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReminderFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReminderEventBridgeRule.Arn
+
+  UserPoolTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UserPoolTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${CognitoUserPool}"
+
+  # Security Group allowing HTTPS access through port 3000
+  InstanceSecurityGroupPort:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow HTTPS access through port 3000
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 3000
+          ToPort: 3000
+
+  # Security Group allowing SSH access through port 22
+  InstanceSecurityGroupSSH:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow SSH access through port 22
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 22
+          ToPort: 22
+
+  # Security Group allowing HTTP access through port 80
+  InstanceSecurityGroupHTTP:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow HTTP access through port 80
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+
+  # EC2 Instance for the application
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref 'KeyName'
+      ImageId: ami-0ae8f15ae66fe8cda
+      SecurityGroups:
+        - !Ref InstanceSecurityGroupPort
+        - !Ref InstanceSecurityGroupSSH
+        - !Ref InstanceSecurityGroupHTTP
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoPool
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref ApiGatewayRestApi
+      ProviderARNs:
+        - Fn::GetAtt:
+            - UserPool
+            - Arn
+
+  # Get All User's Expenses Lambda function
+  GetExpensesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetExpenses
+      Handler: index.handler
+      Role: arn:aws:iam::161623953545:role/LabRole
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          USERS_TABLE: !Ref UsersTable
+          EXPENSES_TABLE: !Ref ExpensesTable
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: get-expenses.zip
+  # Add Expense Lambda function
+  AddExpenseLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AddExpense
+      Handler: index.handler
+      Role: arn:aws:iam::161623953545:role/LabRole
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          USERS_TABLE: !Ref UsersTable
+          EXPENSES_TABLE: !Ref ExpensesTable
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: add-expense.zip
+  # Delete Expense Lambda Function
+  DeleteExpenseLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DeleteExpense
+      Handler: index.handler
+      Role: arn:aws:iam::161623953545:role/LabRole
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          USERS_TABLE: !Ref UsersTable
+          EXPENSES_TABLE: !Ref ExpensesTable
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: delete-expense.zip
+
+  # API Gateway Resource for get Expenses
+  ApiGatewayResourceGetExpenses:
+      Type: "AWS::ApiGateway::Resource"
+      Properties:
+        ParentId: !GetAtt
+          - APIGatewayRestApi
+          - RootResourceId
+        RestApiId: !Ref APIGatewayRestApi
+        PathPart:
+          Ref: GetExpensesLambda
+      DependsOn:
+        - APIGatewayRestApi
+  #  Get Expenses method for API Gateway
+  GetExpensesIntegration:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayResourceGetExpenses
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub:
+            - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetExpensesLambda.Arn}/invocations
+            - { GetExpensesLambda: !GetAtt GetExpensesLambda.Arn }
+      RequestParameters:
+        method.request.querystring.userId: true
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    DependsOn: ApiGatewayResourceGetExpenses
+  # Get Expenses Options Method
+  GetExpensesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayResourceAddExpense
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'*'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'*'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    DependsOn: GetExpensesIntegration
+
+  # API Gateway Resource for add Expense
+  ApiGatewayResourceAddExpense:
+    Type: "AWS::ApiGateway::Resource"
+    Properties:
+      ParentId: !GetAtt
+        - APIGatewayRestApi
+        - RootResourceId
+      RestApiId: !Ref APIGatewayRestApi
+      PathPart:
+        Ref: AddExpenseLambda
+    DependsOn:
+      - APIGatewayRestApi
+  # Add Expense method for API Gateway
+  AddExpenseIntegration:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayResourceAddExpense
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub:
+            - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AddExpenseLambda.Arn}/invocations
+            - { AddExpenseLambda: !GetAtt AddExpenseLambda.Arn }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    DependsOn: ApiGatewayResourceAddExpense
+  # Add Expense Options Method
+  AddExpenseOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayResourceAddExpense
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'*'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+            method.response.header.Access-Control-Allow-Methods: "'*'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    DependsOn: AddExpenseIntegration
+
+  # API Gateway Resource for delete Expense
+  ApiGatewayResourceDeleteExpense:
+      Type: "AWS::ApiGateway::Resource"
+      Properties:
+        ParentId: !GetAtt
+          - APIGatewayRestApi
+          - RootResourceId
+        RestApiId: !Ref APIGatewayRestApi
+        PathPart:
+          Ref: DeleteExpenseLambda
+      DependsOn:
+        - APIGatewayRestApi
+  # Delete Expense method for API Gateway
+  DeleteExpenseIntegration:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      HttpMethod: DELETE
+      ResourceId: !Ref ApiGatewayResourceDeleteExpense
+      RestApiId: !Ref ApiGatewayRestApi
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri:
+          Fn::Sub:
+            - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteExpenseLambda.Arn}/invocations
+            - { DeleteExpenseLambda: !GetAtt DeleteExpenseLambda.Arn }
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    DependsOn:
+      - ApiGatewayResourceDeleteExpense
+  # Delete Expense Options Method
+  DeleteExpenseOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiGatewayResourceAddExpense
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'*'"
+            method.response.header.Access-Control-Allow-Methods: "'*'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+    DependsOn:
+        - DeleteExpenseIntegration
+
+  # API Gateway Deployment
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetExpensesIntegration
+      - GetExpensesOptionsMethod
+      - AddExpenseIntegration
+      - AddExpenseOptionsMethod
+      - DeleteExpenseIntegration
+      - DeleteExpenseOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: !Ref Environment
+
+
+Outputs:
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref CognitoUserPool
+
+  UserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref CognitoUserPoolClient
+
+  UsersTableName:
+    Description: "DynamoDB Users Table Name"
+    Value: !Ref UsersTable
+
+  SnsTopicArn:
+    Description: "SNS Topic ARN"
+    Value: !Ref ExpenseReminderTopic
+
+  Outputs:
+    ApplicationURL:
+      Description: The URL of the deployed application
+      Value: !Join
+        - ''
+        - - 'http://'
+          - !GetAtt
+            - EC2Instance
+            - PublicDnsName
+          - ':3000'
