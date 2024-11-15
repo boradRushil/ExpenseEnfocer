@@ -1,6 +1,11 @@
 # Expense Enforcer
+🚀 Expense Enforcer – A cloud-powered personal finance tracker to help you take control of your expenses! Log, categorize, and monitor your spending habits with ease. Built on a serverless AWS architecture for high performance, security, and scalability.
 
-Expense Enforcer is a robust and scalable web application designed to help users manage their daily expenses efficiently. This application offers features like logging expenses, categorizing them, setting spending limits, and viewing spending patterns. Built with a serverless architecture on AWS, the application ensures high availability, security, and cost efficiency.
+💡 **Key Highlights**:
+- Secure user authentication with **AWS Cognito**.
+- Real-time notifications via **SNS** and **EventBridge**.
+- Persistent data storage powered by **DynamoDB**.  
+  👀 See your finances like never before!
 
 ## **Table of Contents**
 - [Project Overview](#project-overview)
